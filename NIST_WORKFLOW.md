@@ -26,7 +26,7 @@ time are retained. Confirm these against the actual apparatus.
 ```text
 python hbt_nist_acquisition.py --mode full --no-show
 python hbt_nist_acquisition.py --mode analyze --folder "D:\measurements\RUN" --no-show
-python -m unittest -v test_hbt_nist_acquisition.py
+python -m unittest discover -p "test_hbt*.py" -v
 ```
 
 Record the fixed ND filter, laser operating point, thermal settling, dark-count
@@ -173,3 +173,112 @@ The tests run without the instrument. They cover published NIST example values,
 input formats, data-loss gates, timing validation, saved-plan reuse, legacy-run
 provenance and mocked estimator outcomes. Real hardware and the compiled official
 NIST estimator still require validation in the experimental environment.
+
+## Two-detector HBT correlation
+
+The same script now computes the A/B cross-correlation after acquisition and during
+saved-run analysis. This is an independent diagnostic branch: it uses all usable
+timestamps in their common observation span, not the prefix selected for NIST.
+It never alters raw timestamps, the NIST timing digitizer or the comparison bits.
+The only acquisition change for this feature is saving `g2_plan.json` before
+recording; all pair counting happens afterward. It adds processing time and a new
+output folder, not another hardware measurement or live correlation display.
+
+The default settings are **1 ns bins**, **201 bins** with centers from -100 ns to
++100 ns, and zero instrument-delay correction. These are starting settings, not
+measured instrument resolution. All bin edges are left-inclusive/right-exclusive;
+the central bin covers [-0.5 ns, +0.5 ns). The reported central value is a bin
+average, not an infinitely resolved measurement at exactly zero delay.
+
+Every A/B pair inside the lag range contributes; this is not a nearest-neighbor
+start/stop histogram. The explicit sign convention is:
+
+```text
+corrected_lag_ps = timestamp_B - timestamp_A - G2_DELAY_PS
+```
+
+A positive calibrated delay means B's instrument response arrives later than A's.
+Calibrate with an appropriate common timing reference and account for detector,
+cable and optical delays; do not automatically center the largest noisy bin in
+the research data. Adjusting this analysis delay does not shift the stored data.
+
+For stationary independent arrivals, expected accidental pairs in bin i are:
+
+```text
+E_i = (N_A / T) * (N_B / T) * integral_bin max(T - abs(tau + delay), 0) d_tau
+g2_i = observed_pairs_i / E_i
+```
+
+The overlap integral corrects finite-window edges. For narrow lag ranges and zero
+delay this reduces approximately to `R_A * R_B * T * bin_width`, consistent with
+[Swabian's documented correlation normalization](https://www.swabianinstruments.com/static/documentation/TimeTagger/api/measurements/time_histograms.html).
+The script does not force distant bins to average to one or subtract background.
+Normalization assumes stationary rates; inspect the count-rate plot for drift.
+
+The current acquisition does not measure independent start/end gates in hardware
+timestamp units. Therefore, by default HBT uses the intersection of the observed
+A and B event spans, with a half-open window, and explicitly labels the exposure
+as inferred. That can introduce finite-sample endpoint bias. It does not invent
+an exposure from Python wall-clock time. If independently measured gates are
+available, the optional acquisition metadata field `capture_window_ps: [start,end]`
+can supply them; its provenance must be established separately.
+
+Each `hbt_g2_<UTC>` folder contains:
+
+- `g2_correlation.pdf`: normalized curve, unity reference and approximate count
+  uncertainty bands.
+- `g2_histogram.csv` and `.npz`: exact lag edges, coincidence counts, expected
+  accidental counts, normalized values and uncertainty bounds.
+- `g2_report.json`: input hashes, settings, window provenance, count rates, central
+  bin result and interpretation limitations.
+
+Uncertainty bounds are 95% Garwood Poisson intervals on counts divided by the
+estimated accidental denominator. A zero-count bin still has a positive upper
+bound. These are approximate bands: they omit rate-estimation uncertainty,
+dependencies between pairs, drift, detector response and other systematic effects.
+They are not a complete uncertainty budget or a formal test of bunching.
+
+The code flags fewer than 25 expected accidental pairs in the central bin. For
+scale, at 100,000 counts/s on each detector, a 20 s recording and a 1 ns bin give
+about 200 accidental pairs per central bin (roughly 7% Poisson relative counting
+noise near g2=1). Smaller bins or lower rates require longer recordings. A shorter
+bin cannot recover temporal structure already blurred by detector timing jitter.
+
+Automatic analysis reuses the saved HBT plan. Menu option **8**, or the following
+command, recalculates only HBT with the current settings and labels them
+retrospective; it does not rerun the entropy estimator:
+
+```text
+python hbt_nist_acquisition.py --mode g2 --folder "D:\measurements\RUN" --g2-bin-ps 1000 --g2-half-bins 100 --g2-delay-ps 0 --no-show
+```
+
+Set `G2_ENABLED = False` or pass `--no-g2` to skip HBT. The histogram has an explicit
+pair-processing limit (`G2_MAX_PAIRS`, default ten million). If exceeded, analysis
+reports a blocked result; it never exports a silently truncated histogram. Narrow
+the lag range or deliberately increase the limit when appropriate.
+
+### How this helps the further study
+
+Use HBT as a supporting measurement of photon correlations while comparing stable
+operating points below, near and above threshold, and across selected temperature
+settings. A [diode-emission study](https://arxiv.org/abs/1709.05798) demonstrates the
+relevance of second-order coherence to changing diode operating conditions, but
+does not establish what your particular 405 nm diode will show.
+
+A resolved excess near zero delay is consistent with bunching, after instrumental
+effects are excluded. A curve near one means no resolved excess at the measured
+timescales and uncertainty. It does not prove coherent emission, independent timing
+samples, quantum origin or secure random bits. Multimode emission, background,
+timing jitter and bin averaging can suppress visible contrast. Crosstalk can
+produce a spurious peak; detector effects are not automatically corrected.
+
+Record dark/blocked-source controls and independently calibrate relative timing.
+Keep the acquisition and analysis choices consistent across comparison runs;
+check whether each run has adequate coincidence statistics. HBT supplements the
+physical source characterization, while SP 800-90B and the extracted-bit tests
+remain separate analyses.
+
+HBT regression tests check exact all-pair counts and boundary conventions,
+calibrated peak recovery, finite-window normalization, a simulated independent
+baseline, large timestamps, loss blocking and unchanged raw/NIST files. Hardware
+comparison against Swabian's correlation measurement remains a lab validation step.

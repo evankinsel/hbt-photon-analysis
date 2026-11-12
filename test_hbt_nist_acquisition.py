@@ -159,6 +159,8 @@ class NistWorkflowTests(unittest.TestCase):
             def collect(target, timeout, folder):
                 plan = json.loads((folder / "sampling_plan.json").read_text())
                 self.assertEqual(plan["provenance"], "before_acquisition")
+                self.assertEqual(json.loads((folder / "g2_plan.json").read_text())["provenance"],
+                                 "before_acquisition")
                 return {2: np.array([1, 3]), 3: np.array([2, 4])}, {
                     "status": "complete", "error": None, "valid": True}
             def analyze(folder):
@@ -170,6 +172,7 @@ class NistWorkflowTests(unittest.TestCase):
                  patch.object(hbt, "configure_publication_plots"), \
                  patch.object(hbt, "collect", side_effect=collect), \
                  patch.object(hbt, "analyze", side_effect=analyze), \
+                 patch.object(hbt, "analyze_g2"), \
                  patch.object(hbt, "characterize"), contextlib.redirect_stdout(io.StringIO()):
                 hbt.run_acquisition(2, 1)
 

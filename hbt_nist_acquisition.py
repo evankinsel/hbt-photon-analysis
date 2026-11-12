@@ -14,6 +14,7 @@ Features:
 - Publication-quality vector PDF plots
 - Predeclared raw timing samples and official SP 800-90B non-IID runner
 - Three supplementary SP 800-22 diagnostics (not the full 15-test suite)
+- Independent two-detector HBT g2 histogram, normalization and count intervals
 
 See NIST_WORKFLOW.md for the sampling model, setup, commands and limitations.
 
@@ -37,6 +38,7 @@ import re
 import subprocess
 
 from scipy.special import gammaincc
+from scipy.stats import chi2
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1045,6 +1047,13 @@ EA_NON_IID = None  # Absolute path to a compiled official ea_non_iid executable.
 EA_TIMEOUT_S = 3600
 NIST_MIN_SAMPLES = 1_000_000
 
+# Independent HBT diagnostic; these do not change the NIST/extractor inputs.
+G2_ENABLED = True
+G2_BIN_WIDTH_PS = 1000  # 1 ns, illustrative; choose for detector jitter/coherence time.
+G2_HALF_BINS = 100  # 201 bins centered from -100 to +100 ns by default.
+G2_DELAY_PS = 0  # Subtract independently calibrated B-minus-A instrument delay.
+G2_MAX_PAIRS = 10_000_000  # Fail explicitly rather than truncate a large histogram.
+
 
 def sha256_file(path):
     digest = hashlib.sha256()
@@ -1383,6 +1392,225 @@ def analyze(folder):
     return output
 
 
+def g2_settings(provenance):
+    settings = {"schema_version": 1, "enabled": G2_ENABLED,
+                "bin_width_ps": G2_BIN_WIDTH_PS, "half_bins": G2_HALF_BINS,
+                "delay_ps": G2_DELAY_PS, "max_pairs": G2_MAX_PAIRS,
+                "provenance": provenance,
+                "lag_convention": "tau_ps = t_B - t_A - delay_ps"}
+    validate_g2_settings(settings)
+    return settings
+
+
+def validate_g2_settings(settings):
+    if settings.get("schema_version") != 1 or type(settings.get("enabled")) is not bool:
+        raise ValueError("Unsupported HBT settings")
+    for key in ("bin_width_ps", "half_bins", "max_pairs"):
+        if type(settings[key]) is not int or settings[key] <= 0:
+            raise ValueError(f"HBT {key} must be a positive integer")
+    if settings["bin_width_ps"] % 2:
+        raise ValueError("Use an even integer ps bin width for bins centered at zero")
+    if type(settings["delay_ps"]) is not int:
+        raise ValueError("HBT delay_ps must be an integer")
+    if settings["half_bins"] > 100_000:
+        raise ValueError("HBT histogram limited to 200001 bins")
+    extent = (settings["half_bins"] + 1) * settings["bin_width_ps"] + abs(settings["delay_ps"])
+    if extent > np.iinfo(np.int64).max // 2:
+        raise ValueError("HBT lag range exceeds integer arithmetic limits")
+
+
+def g2_overlap_area(edges_ps, duration_ps, delay_ps=0):
+    """Integral of max(T - abs(tau + delay), 0) over each bin, in ps**2.
+
+    Integrate each linear segment separately to avoid subtracting two large
+    squares when the bin width is tiny compared to the exposure.
+    """
+    t = float(duration_ps)
+    edges = np.asarray(edges_ps, dtype=float) + delay_ps
+    left, right = np.clip(edges[:-1], -t, t), np.clip(edges[1:], -t, t)
+    neg_l, neg_r = np.minimum(left, 0), np.minimum(right, 0)
+    pos_l, pos_r = np.maximum(left, 0), np.maximum(right, 0)
+    return ((neg_r - neg_l) * (t + (neg_l + neg_r) / 2)
+            + (pos_r - pos_l) * (t - (pos_l + pos_r) / 2))
+
+
+def g2_pair_counts(a, b, edges, delay_ps, max_pairs):
+    """Count ALL A/B pairs in [left, right) lag bins, not nearest neighbors.
+
+    Sorted integer arrays are relative to the same window start. Search only
+    nearby B events, then expand in bounded chunks; never form an NxM matrix.
+    """
+    counts = np.zeros(len(edges) - 1, dtype=np.int64)
+    total = 0
+    left_shift, right_shift = int(edges[0]) + delay_ps, int(edges[-1]) + delay_ps
+    width = int(edges[1]) - int(edges[0])
+    limit = np.iinfo(np.int64).max
+    if (max(abs(left_shift), abs(right_shift)) + max(int(a[-1]), int(b[-1])) > limit):
+        raise ValueError("HBT timestamp plus lag could overflow int64")
+    for start in range(0, len(a), 50_000):
+        anchors = a[start:start + 50_000]
+        low = np.searchsorted(b, anchors + left_shift, side="left")
+        high = np.searchsorted(b, anchors + right_shift, side="left")
+        lengths = high - low
+        chunk_pairs = int(lengths.sum())
+        total += chunk_pairs
+        if total > max_pairs:
+            raise ValueError("HBT pair limit exceeded; increase G2_MAX_PAIRS or narrow the lag range; no partial histogram exported")
+        # Bound temporary expansion even for very dense local bursts.
+        cumulative = np.concatenate(([0], np.cumsum(lengths)))
+        for offset in range(0, chunk_pairs, 250_000):
+            flat = np.arange(offset, min(offset + 250_000, chunk_pairs))
+            anchor_index = np.searchsorted(cumulative[1:], flat, side="right")
+            b_index = low[anchor_index] + flat - cumulative[anchor_index]
+            lag = b[b_index] - anchors[anchor_index] - delay_ps
+            index = (lag - int(edges[0])) // width
+            counts += np.bincount(index, minlength=len(counts))
+    return counts
+
+
+def calculate_g2(timestamps_a, timestamps_b, settings, window_ps=None):
+    """Stationary-rate cross-correlation estimate with finite-window correction.
+
+    If no independent capture window is available, use the intersection of the
+    two observed timestamp spans and explicitly label this estimated exposure.
+    """
+    validate_g2_settings(settings)
+    timing_intervals(timestamps_a)
+    timing_intervals(timestamps_b)
+    a = np.asarray(timestamps_a, dtype=np.int64)
+    b = np.asarray(timestamps_b, dtype=np.int64)
+    if len(a) < 2 or len(b) < 2:
+        raise ValueError("HBT needs at least two timestamps per detector")
+    if window_ps is None:
+        lo, hi = max(int(a[0]), int(b[0])), min(int(a[-1]), int(b[-1]))
+        window_source = "inferred_intersection_of_observed_event_spans"
+    else:
+        if (len(window_ps) != 2 or any(type(x) is not int for x in window_ps)
+                or not 0 <= window_ps[0] < window_ps[1] <= np.iinfo(np.int64).max):
+            raise ValueError("Invalid independently measured capture window")
+        lo, hi = window_ps
+        window_source = "explicit_capture_window"
+    if hi <= lo:
+        raise ValueError("No positive overlapping observation span")
+    a = a[(a >= lo) & (a < hi)] - lo
+    b = b[(b >= lo) & (b < hi)] - lo
+    if len(a) < 2 or len(b) < 2:
+        raise ValueError("Insufficient events inside the common HBT window")
+    t = hi - lo
+    width, half, delay = (settings[k] for k in ("bin_width_ps", "half_bins", "delay_ps"))
+    centers = np.arange(-half, half + 1, dtype=np.int64) * width
+    edges = np.arange(-half, half + 2, dtype=np.int64) * width - width // 2
+    area = g2_overlap_area(edges, t, delay)
+    if np.any(area <= 0):
+        raise ValueError("HBT lag range lies outside the available overlap; reduce span/delay")
+    counts = g2_pair_counts(a, b, edges, delay, settings["max_pairs"])
+    expected = (len(a) / float(t)) * (len(b) / float(t)) * area
+    normalized = counts / expected
+    # Garwood intervals on counts; rates are treated as fixed. These are
+    # approximate g2 uncertainty bands, not a full correlated-data inference.
+    lower = np.zeros(len(counts), dtype=float)
+    nonzero = counts > 0
+    lower[nonzero] = 0.5 * chi2.ppf(0.025, 2 * counts[nonzero]) / expected[nonzero]
+    upper = 0.5 * chi2.ppf(0.975, 2 * (counts + 1)) / expected
+    warnings = ["Assumes stationary rates; no dark-count, afterpulse, crosstalk or jitter correction.",
+                "Poisson count intervals omit rate-estimation uncertainty and pair dependence.",
+                "A flat curve does not exclude correlations narrower than the instrument response."]
+    if window_ps is None:
+        warnings.append("Exposure is inferred from event endpoints, not measured acquisition gates; finite-sample boundary bias is possible.")
+    if expected[half] < 25:
+        warnings.append("Fewer than 25 expected accidental pairs in the central bin; collect longer before interpreting its value.")
+    if max(abs(int(edges[0]) + delay), abs(int(edges[-1]) + delay)) > t / 10:
+        warnings.append("Lag range is a substantial fraction of exposure; interpret edge estimates cautiously.")
+    summary = {"status": "estimated", "settings": settings,
+               "window_ps": [lo, hi], "window_source": window_source,
+               "duration_seconds": t * 1e-12, "A_count": len(a), "B_count": len(b),
+               "A_cps": len(a) / (t * 1e-12), "B_cps": len(b) / (t * 1e-12),
+               "lag_convention": "tau_ps = t_B - t_A - delay_ps",
+               "bin_convention": "left-inclusive, right-exclusive for every bin",
+               "normalization": "C_i / [(N_A/T)(N_B/T) integral_bin max(T-|tau+delay|,0) d_tau]",
+               "total_pairs_in_histogram": int(counts.sum()),
+               "central_bin": {"edges_ps": [int(edges[half]), int(edges[half + 1])],
+                   "counts": int(counts[half]), "expected_accidental_counts": float(expected[half]),
+                   "g2_bin_average": float(normalized[half]),
+                   "approximate_poisson_95_interval": [float(lower[half]), float(upper[half])]},
+               "warnings": warnings}
+    return summary, {"lag_ps": centers, "left_edge_ps": edges[:-1], "right_edge_ps": edges[1:],
+                     "coincidences": counts, "expected_accidentals": expected,
+                     "g2": normalized, "poisson95_lower": lower, "poisson95_upper": upper}
+
+
+def analyze_g2(folder, use_saved_settings=True):
+    """Independent HBT output folder. Never writes NIST, raw or extracted files."""
+    folder = Path(folder)
+    if not G2_ENABLED:
+        return None
+    output = folder / ("hbt_g2_" + stamp())
+    output.mkdir()
+    report = {"status": "blocked", "analysis_script_sha256": sha256_file(__file__),
+              "created_utc": datetime.now(timezone.utc).isoformat()}
+    try:
+        info_path = folder / "acquisition.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        report["acquisition_sha256"] = sha256_file(info_path)
+        problems = acquisition_problems(info)
+        if info.get("channels") != [CH_A, CH_B]:
+            problems.append("Saved channels differ from the current configuration")
+        if problems:
+            raise ValueError("; ".join(problems))
+        settings_path = folder / "g2_plan.json"
+        if use_saved_settings and settings_path.exists():
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        else:
+            settings = g2_settings("retrospective_current_settings")
+        validate_g2_settings(settings)
+        report["settings"] = settings
+        if not settings["enabled"]:
+            report["status"] = "disabled_in_saved_plan"
+            save_json(output / "g2_report.json", report)
+            return output
+        arrays = []
+        for channel in (CH_A, CH_B):
+            path = folder / f"raw_ch{channel}.npy"
+            values = np.load(path, allow_pickle=False)
+            if info.get("raw_events", {}).get(str(channel)) != len(values):
+                raise ValueError(f"Channel {channel} event count disagrees with metadata")
+            report[f"raw_ch{channel}_sha256"] = sha256_file(path)
+            arrays.append(values)
+        summary, columns = calculate_g2(*arrays, settings,
+                                       window_ps=info.get("capture_window_ps"))
+        report.update(summary)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+        report["problem"] = str(exc)
+        save_json(output / "g2_report.json", report)
+        print("HBT analysis blocked:", exc)
+        return output
+    save_json(output / "g2_report.json", report)
+    # Keep integer ps delays and pair counts exact in the CSV.
+    import csv
+    with (output / "g2_histogram.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerows(zip(*(col.tolist() for col in columns.values())))
+    np.savez(output / "g2_histogram.npz", **columns)
+    try:
+        fig, ax = manuscript_figure()
+        lag_ns = columns["lag_ps"] * 1e-3
+        ax.step(lag_ns, columns["g2"], where="mid", label="A/B correlation")
+        ax.fill_between(lag_ns, columns["poisson95_lower"], columns["poisson95_upper"],
+                        step="mid", alpha=0.2, label="Approx. 95% count interval")
+        ax.axhline(1.0, color="black", linestyle="--", linewidth=0.8)
+        ax.set(xlabel=r"Corrected delay $\tau$ (ns)", ylabel=r"$g^{(2)}_{AB}(\tau)$",
+               title="HBT cross-correlation")
+        ax.legend(frameon=False)
+        save_manuscript_figure(fig, output, "g2_correlation.pdf")
+    except (OSError, RuntimeError, ValueError) as exc:
+        report["plot_error"] = str(exc)
+        save_json(output / "g2_report.json", report)
+        plt.close("all")
+    print("HBT correlation saved to:", output.resolve())
+    return output
+
+
 def nist_selftest():
     """Published short examples verify formulas; they are not production samples."""
     bits = np.array(list("1011010101"), dtype=np.uint8)
@@ -1403,9 +1631,10 @@ def main(argv=None):
     global MODE, ANALYZE_FOLDER, SHOW_FIGURES, EA_NON_IID
     global RAW_SAMPLE_COUNT, RAW_BIN_WIDTH_PS, RAW_BITS_PER_SYMBOL
     global SP22_SEQUENCE_BITS, SP22_BLOCK_BITS
+    global G2_ENABLED, G2_BIN_WIDTH_PS, G2_HALF_BINS, G2_DELAY_PS
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["menu", "selftest", "short", "full", "continuous", "analyze"], default=MODE)
-    parser.add_argument("--folder", type=Path, help="Saved acquisition folder for --mode analyze")
+    parser.add_argument("--mode", choices=["menu", "selftest", "short", "full", "continuous", "analyze", "g2"], default=MODE)
+    parser.add_argument("--folder", type=Path, help="Saved acquisition folder for --mode analyze or g2")
     parser.add_argument("--no-show", action="store_true", help="Save PDFs without opening windows")
     parser.add_argument("--ea-non-iid", help="Official ea_non_iid executable; not run unless specified")
     parser.add_argument("--samples", type=int, default=RAW_SAMPLE_COUNT)
@@ -1413,6 +1642,11 @@ def main(argv=None):
     parser.add_argument("--bits-per-symbol", type=int, default=RAW_BITS_PER_SYMBOL)
     parser.add_argument("--sequence-bits", type=int, default=SP22_SEQUENCE_BITS)
     parser.add_argument("--block-bits", type=int, default=SP22_BLOCK_BITS)
+    parser.add_argument("--no-g2", action="store_true", help="Skip independent HBT processing")
+    parser.add_argument("--g2-bin-ps", type=int, default=G2_BIN_WIDTH_PS)
+    parser.add_argument("--g2-half-bins", type=int, default=G2_HALF_BINS)
+    parser.add_argument("--g2-delay-ps", type=int, default=G2_DELAY_PS,
+                        help="Subtract calibrated B-minus-A delay; use --mode g2 to reanalyze with current settings")
     args = parser.parse_args(argv)
     MODE = args.mode
     ANALYZE_FOLDER = args.folder if args.folder is not None else ANALYZE_FOLDER
@@ -1421,6 +1655,9 @@ def main(argv=None):
     RAW_SAMPLE_COUNT, RAW_BIN_WIDTH_PS = args.samples, args.bin_width_ps
     RAW_BITS_PER_SYMBOL = args.bits_per_symbol
     SP22_SEQUENCE_BITS, SP22_BLOCK_BITS = args.sequence_bits, args.block_bits
+    G2_ENABLED = G2_ENABLED and not args.no_g2
+    G2_BIN_WIDTH_PS, G2_HALF_BINS, G2_DELAY_PS = args.g2_bin_ps, args.g2_half_bins, args.g2_delay_ps
+    g2_settings("configuration_check")
     sampling_plan("configuration_check")
     if MODE == "menu":
         experiment_menu()
@@ -1773,6 +2010,7 @@ def analyze_saved_run(folder=None):
     configure_publication_plots()
 
     analyze(folder)
+    analyze_g2(folder)
     characterize(raw, info, folder)
 
     print(
@@ -1801,6 +2039,7 @@ def run_acquisition(target=None, timeout=None):
 
     folder.mkdir()
     save_json(folder / "sampling_plan.json", sampling_plan("before_acquisition"))
+    save_json(folder / "g2_plan.json", g2_settings("before_acquisition"))
 
     print(
         "\nRecording BOTH SPAD channels."
@@ -1881,6 +2120,7 @@ def run_acquisition(target=None, timeout=None):
         )
 
     analyze(folder)  # Also writes a blocked report for invalid acquisitions.
+    analyze_g2(folder)
     characterize(raw, info, folder)
 
     print(
@@ -1917,6 +2157,13 @@ def run_mode(mode):
     elif mode == "analyze":
 
         analyze_saved_run()
+
+    elif mode == "g2":
+
+        folder = choose_saved_run()
+        if folder is not None:
+            configure_publication_plots()
+            analyze_g2(folder, use_saved_settings=False)
 
     elif mode == "continuous":
 
@@ -1985,6 +2232,10 @@ def experiment_menu():
         )
 
         print(
+            "8. HBT g2 only        Reanalyze with current HBT settings"
+        )
+
+        print(
             "0. Exit"
         )
 
@@ -2007,7 +2258,7 @@ def experiment_menu():
         )
 
         choice = input(
-            "\nSelect 0-7: "
+            "\nSelect 0-8: "
         ).strip()
 
         if choice in {
@@ -2038,7 +2289,8 @@ def experiment_menu():
             "2": "short",
             "3": "full",
             "4": "analyze",
-            "7": "continuous"
+            "7": "continuous",
+            "8": "g2"
         }
 
         mode = choices.get(
@@ -2048,7 +2300,7 @@ def experiment_menu():
         if mode is None:
 
             print(
-                "Choose 0, 1, 2, 3, 4, 5, 6, or 7."
+                "Choose 0, 1, 2, 3, 4, 5, 6, 7, or 8."
             )
 
             continue
